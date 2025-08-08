@@ -5,6 +5,8 @@ tqdm
 wget
 
 # Audio processing
+onnxruntime_gpu
+pydub==0.25.1
 ffmpeg-python>=0.2.0
 faiss-cpu==1.7.3
 librosa==0.11.0
@@ -25,9 +27,8 @@ PyWavelets==1.8.0
 
 # Machine learning and deep learning
 numba==0.61.0; sys_platform == 'win32'
-torch==2.7.1
-torchaudio==2.7.1
-torchvision==0.22.1
+--find-links https://download.pytorch.org/whl/torch/
+torch==2.7.1+cu128
 torchcrepe==0.0.23
 torchfcpe
 torch-optimizer
@@ -49,3 +50,4 @@ pypresence
 beautifulsoup4
 flask
 psutil==7.0.0
+yt_dlp==2025.2.19

@@ -5,6 +5,11 @@ import shutil
 import datetime
 import json
 import torch
+import hashlib
+from contextlib import suppress
+from urllib.parse import urlparse, parse_qs
+from yt_dlp import YoutubeDL
+from pydub import AudioSegment
 
 from core import (
     run_infer_script,
@@ -72,7 +77,6 @@ audio_paths = [
     for root, _, files in os.walk(audio_root_relative, topdown=False)
     for name in files
     if name.endswith(tuple(sup_audioext))
-    and root == audio_root_relative
     and "_output" not in name
 ]
 
@@ -163,13 +167,35 @@ def refresh_presets():
     return gr.update(choices=json_files)
 
 
-def output_path_fn(input_audio_path):
-    original_name_without_extension = os.path.basename(input_audio_path).rsplit(".", 1)[
-        0
-    ]
-    new_name = original_name_without_extension + "_output.wav"
-    output_path = os.path.join(os.path.dirname(input_audio_path), new_name)
-    return output_path
+def generate_inference_filename(input_audio_path, voice_model, pitch=0, index_rate=0.5, filter_radius=3, rms_mix_rate=1.0, protect=0.33, f0_method="rmvpe", hop_length=128, output_type="acapella"):
+    """Generate proper filename for inference outputs"""
+    original_name = os.path.splitext(os.path.basename(input_audio_path))[0]
+    original_name = format_title(original_name) 
+    
+    model_name = os.path.splitext(os.path.basename(voice_model))[0] if voice_model else "unknown_model"
+    model_name = format_title(model_name)  
+    
+    if output_type == "acapella":
+        filename = f"{original_name}_{model_name}_acapella.wav"
+    else:  
+        filename = f"{original_name} ({model_name} Ver).wav"
+    
+    output_dir = os.path.dirname(input_audio_path)
+    return os.path.join(output_dir, filename)
+
+
+def output_path_fn(input_audio_path, voice_model="", pitch=0, index_rate=0.5, filter_radius=3, rms_mix_rate=1.0, protect=0.33, f0_method="rmvpe", hop_length=128):
+    """Generate output path for inference - acapella version by default"""
+    if input_audio_path.startswith("http"):
+        video_id = get_youtube_video_id(input_audio_path)
+        if video_id:
+            youtube_dir = os.path.join(audio_root_relative, video_id)
+            placeholder_path = os.path.join(youtube_dir, "youtube_audio.wav")
+            return generate_inference_filename(placeholder_path, voice_model, pitch, index_rate, filter_radius, rms_mix_rate, protect, f0_method, hop_length, "acapella")
+        else:
+            return os.path.join(audio_root_relative, "youtube_output.wav")
+    else:
+        return generate_inference_filename(input_audio_path, voice_model, pitch, index_rate, filter_radius, rms_mix_rate, protect, f0_method, hop_length, "acapella")
 
 
 def change_choices(model):
@@ -199,7 +225,6 @@ def change_choices(model):
         for root, _, files in os.walk(audio_root_relative, topdown=False)
         for name in files
         if name.endswith(tuple(sup_audioext))
-        and root == audio_root_relative
         and "_output" not in name
     ]
 
@@ -269,6 +294,115 @@ def save_to_wav2(upload_audio):
     shutil.copy(file_path, target_path)
     return target_path, output_path_fn(target_path)
 
+# function to download audio from youtube
+def download_yt_audio(youtube_link):
+    """Download audio from a YouTube URL and save it to a organized directory structure."""
+    if not youtube_link or not youtube_link.startswith("http"):
+        gr.Info("Please provide a valid YouTube URL.")
+        return "", ""
+    
+    video_id = get_youtube_video_id(youtube_link)
+    if video_id is None:
+        gr.Info("Invalid YouTube URL.")
+        return "", ""
+    
+    song_dir = os.path.join(audio_root_relative, video_id)
+    os.makedirs(song_dir, exist_ok=True)
+    
+    import yt_dlp
+    ydl_opts = {
+        "format": "bestaudio",
+        "outtmpl": os.path.join(song_dir, "%(title)s.%(ext)s"),
+        "nocheckcertificate": True,
+        "ignoreerrors": True,
+        "no_warnings": True,
+        "quiet": True,
+        "extractaudio": True,
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav"}],
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(youtube_link, download=True)
+            download_path = ydl.prepare_filename(info)
+            if not download_path.lower().endswith('.wav') and os.path.exists(download_path):
+                base = os.path.splitext(download_path)[0]
+                wav_path = f"{base}.wav"
+                try:
+                    AudioSegment.from_file(download_path).export(wav_path, format="wav")
+                    os.remove(download_path)
+                except Exception as conv_e:
+                    print(f"Conversion to WAV failed: {conv_e}")
+                download_path = wav_path
+    except Exception as e:
+        gr.Info(f"YouTube download error: {e}")
+        return "", ""
+    rel_path = os.path.relpath(download_path, now_dir)
+    return rel_path, output_path_fn(rel_path)
+
+# function to preprocess audio with mdx to separate vocals, instrumentals and reverb
+def preprocess_audio_mdx(audio_path, output_path):
+    try:
+        from mdx import run_mdx
+        import json
+        mdx_models_dir = os.path.join(now_dir, "rvc", "models", "mdxnet")
+        model_data_json = os.path.join(mdx_models_dir, "model_data.json")
+        if not (os.path.exists(mdx_models_dir) and os.path.exists(model_data_json)):
+            return audio_path, output_path
+        with open(model_data_json, "r", encoding="utf-8") as infile:
+            mdx_model_params = json.load(infile)
+        
+        song_dir = os.path.dirname(audio_path)
+        if not song_dir:
+            song_dir = audio_root_relative
+        
+        base_name = os.path.splitext(os.path.basename(audio_path))[0]
+        instrumentals_path = os.path.join(song_dir, f"{base_name}_Instrumental.wav")
+        backup_vocals_path = os.path.join(song_dir, f"{base_name}_Vocals_Backup.wav") 
+        main_vocals_dereverb_path = os.path.join(song_dir, f"{base_name}_Vocals_Main_DeReverb.wav")
+        
+        if (os.path.exists(instrumentals_path) and 
+            os.path.exists(backup_vocals_path) and 
+            os.path.exists(main_vocals_dereverb_path)):
+            print("MDX files already exist, skipping preprocessing...")
+            new_output_path = os.path.join(song_dir, os.path.basename(output_path))
+            return main_vocals_dereverb_path, new_output_path, instrumentals_path, backup_vocals_path
+        
+        base_audio_path = os.path.join(now_dir, audio_path)
+        vocals_path, instrumentals_path = run_mdx(
+            mdx_model_params,
+            song_dir,
+            os.path.join(mdx_models_dir, "UVR-MDX-NET-Voc_FT.onnx"),
+            base_audio_path,
+            denoise=True,
+            keep_orig=True,
+        )
+        backup_vocals_path, main_vocals_path = run_mdx(
+            mdx_model_params,
+            song_dir,
+            os.path.join(mdx_models_dir, "UVR_MDXNET_KARA_2.onnx"),
+            vocals_path,
+            suffix="Backup",
+            invert_suffix="Main",
+            denoise=True,
+        )
+        _, main_vocals_dereverb_path = run_mdx(
+            mdx_model_params,
+            song_dir,
+            os.path.join(mdx_models_dir, "Reverb_HQ_By_FoxJoy.onnx"),
+            main_vocals_path,
+            invert_suffix="DeReverb",
+            exclude_main=True,
+            denoise=True,
+        )
+        new_output_path = os.path.join(song_dir, os.path.basename(output_path))
+        if os.path.exists(vocals_path):
+            os.remove(vocals_path)
+        if os.path.exists(main_vocals_path):
+            os.remove(main_vocals_path)
+        return main_vocals_dereverb_path, new_output_path, instrumentals_path, backup_vocals_path
+    except Exception as e:
+        print(f"MDX preprocessing error: {e}")
+        return audio_path, output_path
 
 def delete_outputs():
     gr.Info(f"Inference outputs cleared!")
@@ -354,7 +488,7 @@ def inference_tab():
         with gr.Row():
             model_file = gr.Dropdown(
                 label="Voice Model",
-                info="Select the voice model used for inference.",
+                info="Select the voice model to use for inference.",
                 choices=sorted(names, key=lambda x: extract_model_and_epoch(x)),
                 interactive=True,
                 value=default_weight,
@@ -363,7 +497,7 @@ def inference_tab():
 
             index_file = gr.Dropdown(
                 label="Index File",
-                info="Select the index file used for inference.",
+                info="Select the index file to use for inference.",
                 choices=get_indexes(),
                 value=match_index(default_weight) if default_weight else "",
                 interactive=True,
@@ -395,14 +529,23 @@ def inference_tab():
                 label="Upload Audio", type="filepath", editable=False
             )
             with gr.Row():
-                audio = gr.Dropdown(
-                    label="Select Audio Input",
-                    info="Select the audio for inference.",
-                    choices=sorted(audio_paths),
-                    value=audio_paths[0] if audio_paths else "",
+                audio = gr.Textbox(
+                    label="Youtube Audio Input",
+                    info="Paste YouTube URL for inference.",
+                    placeholder="https://www.youtube.com/watch?v=...",
+                    value="",
                     interactive=True,
-                    allow_custom_value=True,
                 )
+
+            audio_dropdown = gr.Dropdown(
+                label="Select Local Audio Input",
+                info="Select the audio for inference.",
+                choices=sorted(audio_paths),
+                value="",
+                interactive=True,
+                allow_custom_value=True,
+            )
+        has_bg_music = gr.Checkbox(label="Input contains background music", value=False)
 
         with gr.Accordion("Advanced Settings for inference", open=False):
             with gr.Column():
@@ -988,7 +1131,170 @@ def inference_tab():
                 message = "You must agree to the Terms of Use to proceed."
                 gr.Info(message)
                 return message, None
-            return run_infer_script(*args)
+            args = list(args)
+            
+            try:
+                pitch = args[0] if len(args) > 0 else 0
+                filter_radius = args[1] if len(args) > 1 else 3
+                index_rate = args[2] if len(args) > 2 else 0.5
+                rms_mix_rate = args[3] if len(args) > 3 else 1.0
+                protect = args[4] if len(args) > 4 else 0.33
+                hop_length = args[5] if len(args) > 5 else 128
+                f0_method = args[6] if len(args) > 6 else "rmvpe"
+                original_audio_path = args[7] if len(args) > 7 else ""
+                
+                if not original_audio_path:
+                    message = "No audio input provided."
+                    gr.Info(message)
+                    return message, None
+                has_bg_music_flag = args[8] if len(args) > 8 else False
+                original_output_path = args[9] if len(args) > 9 else ""
+                model_file = args[10] if len(args) > 10 else ""
+                
+                if not model_file:
+                    message = "No model path provided."
+                    gr.Info(message)
+                    return message, None
+                
+                if original_audio_path.startswith("http"):
+                    video_id = get_youtube_video_id(original_audio_path)
+                    if video_id is None:
+                        gr.Info("Invalid YouTube URL.")
+                        return "Invalid YouTube URL.", None
+                    
+                    song_dir = os.path.join(audio_root_relative, video_id)
+                    os.makedirs(song_dir, exist_ok=True)
+                    
+                    # Check for existing audio files
+                    existing_audio = None
+                    for ext in ['wav', 'mp3', 'mp4', 'm4a', 'flac', 'ogg']:
+                        pattern = os.path.join(song_dir, f"*.{ext}")
+                        import glob
+                        matching_files = glob.glob(pattern)
+                        if matching_files:
+                            existing_audio = matching_files[0]
+                            break
+                    
+                    if existing_audio:
+                        gr.Info("Audio file already exists, skipping download...")
+                        audio_path = os.path.relpath(existing_audio, now_dir)
+                    else:
+                        gr.Info("Downloading from YouTube...")
+                        import yt_dlp
+                        ydl_opts = {
+                            "format": "bestaudio",
+                            "outtmpl": os.path.join(song_dir, "%(title)s.%(ext)s"),
+                            "nocheckcertificate": True,
+                            "ignoreerrors": True,
+                            "no_warnings": True,
+                            "quiet": True,
+                            "extractaudio": True,
+                            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav"}],
+                        }
+                        
+                        try:
+                            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                info = ydl.extract_info(original_audio_path, download=True)
+                                download_path = ydl.prepare_filename(info)
+                                if not download_path.lower().endswith('.wav') and os.path.exists(download_path):
+                                    base = os.path.splitext(download_path)[0]
+                                    wav_path = f"{base}.wav"
+                                    try:
+                                        AudioSegment.from_file(download_path).export(wav_path, format="wav")
+                                        os.remove(download_path)
+                                    except Exception as conv_e:
+                                        print(f"Conversion to WAV failed: {conv_e}")
+                                    download_path = wav_path
+                            audio_path = os.path.relpath(download_path, now_dir)
+                        except Exception as e:
+                            gr.Info(f"YouTube download error: {e}")
+                            return f"YouTube download error: {e}", None
+                
+                else:
+                    if os.path.dirname(original_audio_path).split(os.sep)[-1] != os.path.basename(audio_root_relative):
+                        audio_path = original_audio_path
+                    else:
+                        full_audio_path = os.path.join(now_dir, original_audio_path)
+                        if os.path.exists(full_audio_path):
+                            file_hash = get_hash(full_audio_path)
+                            
+                            song_dir = os.path.join(audio_root_relative, file_hash)
+                            os.makedirs(song_dir, exist_ok=True)
+                            
+                            filename = os.path.basename(original_audio_path)
+                            new_audio_path = os.path.join(song_dir, filename)
+                            full_new_audio_path = os.path.join(now_dir, new_audio_path)
+                            
+                            if not os.path.exists(full_new_audio_path):
+                                shutil.copy2(full_audio_path, full_new_audio_path)
+                            
+                            audio_path = new_audio_path
+                        else:
+                            audio_path = original_audio_path
+                
+                acapella_output_path = generate_inference_filename(
+                    audio_path, model_file, pitch, index_rate, filter_radius, 
+                    rms_mix_rate, protect, f0_method, 128, "acapella"
+                )
+                
+                instrumental_path = backup_vocals_path = None
+                if has_bg_music_flag:
+                    mdx_result = preprocess_audio_mdx(audio_path, acapella_output_path)
+                    if len(mdx_result) == 4:
+                        new_audio_path, new_output_path, instrumental_path, backup_vocals_path = mdx_result
+                        audio_path = new_audio_path
+                        acapella_output_path = new_output_path
+                        
+            except Exception as e:
+                print(f"Audio preprocessing error: {e}")
+                instrumental_path, backup_vocals_path = None, None
+                acapella_output_path = original_output_path
+                
+            message, ai_vocals_path = run_infer_script(
+                pitch=pitch,
+                filter_radius=filter_radius, 
+                index_rate=index_rate,
+                volume_envelope=rms_mix_rate,
+                protect=protect,
+                hop_length=hop_length,
+                f0_method=f0_method,
+                input_path=audio_path,
+                output_path=acapella_output_path,
+                pth_path=model_file,
+                index_path=args[11] if len(args) > 11 else "",
+                split_audio=args[12] if len(args) > 12 else False,
+                f0_autotune=args[13] if len(args) > 13 else False,
+                f0_autotune_strength=args[14] if len(args) > 14 else 1.0,
+                clean_audio=args[15] if len(args) > 15 else False,
+                clean_strength=args[16] if len(args) > 16 else 0.7,
+                export_format=str(args[17]) if len(args) > 17 else "WAV",
+                f0_file=args[18] if len(args) > 18 else None,
+                embedder_model=args[19] if len(args) > 19 else "contentvec",
+                embedder_model_custom=args[20] if len(args) > 20 else None
+            )
+            final_output_path = ai_vocals_path
+            
+            try:
+                if instrumental_path and backup_vocals_path and os.path.exists(ai_vocals_path):
+                    cover_output_path = generate_inference_filename(
+                        audio_path, model_file, pitch, index_rate, filter_radius,
+                        rms_mix_rate, protect, f0_method, 128, "cover"
+                    )
+                    
+                    # Mix stems
+                    main_vocal_audio = AudioSegment.from_file(ai_vocals_path) - 4
+                    backup_vocal_audio = AudioSegment.from_wav(os.path.join(now_dir, backup_vocals_path)) - 6
+                    instrumental_audio = AudioSegment.from_wav(os.path.join(now_dir, instrumental_path)) - 7
+                    mixed = instrumental_audio.overlay(backup_vocal_audio).overlay(main_vocal_audio)
+                    
+                    mixed.export(cover_output_path, format="wav")
+                    final_output_path = cover_output_path
+                    gr.Info(f"Cover version saved as: {os.path.basename(cover_output_path)}")
+                    
+            except Exception as e:
+                print(f"Error creating cover version: {e}")
+                
+            return message, final_output_path
 
         def enforce_terms_batch(terms_accepted, *args):
             if not terms_accepted:
@@ -1930,7 +2236,7 @@ def inference_tab():
     refresh_button.click(
         fn=change_choices,
         inputs=[model_file],
-        outputs=[model_file, index_file, audio, sid, sid_batch],
+        outputs=[model_file, index_file, audio_dropdown, sid, sid_batch],
     )
     audio.change(
         fn=output_path_fn,
@@ -1947,6 +2253,19 @@ def inference_tab():
         inputs=[upload_audio],
         outputs=[audio, output_path],
     )
+    
+    audio_dropdown.change(
+        fn=lambda selected: (selected, output_path_fn(selected) if selected else ""),
+        inputs=[audio_dropdown],
+        outputs=[audio, output_path],
+    )
+    
+    audio.change(
+        fn=lambda youtube_url: output_path_fn(youtube_url) if youtube_url and youtube_url.startswith("http") else "",
+        inputs=[audio],
+        outputs=[output_path],
+    )
+
     clear_outputs_infer.click(
         fn=delete_outputs,
         inputs=[],
@@ -2003,6 +2322,7 @@ def inference_tab():
             hop_length,
             f0_method,
             audio,
+            has_bg_music,
             output_path,
             model_file,
             index_file,
@@ -2135,3 +2455,34 @@ def inference_tab():
         inputs=[],
         outputs=[convert_button_batch, stop_button],
     )
+
+def get_hash(filepath):
+    """Generate hash for local audio files"""
+    with open(filepath, 'rb') as f:
+        file_hash = hashlib.blake2b()
+        while chunk := f.read(8192):
+            file_hash.update(chunk)
+    return file_hash.hexdigest()[:11]
+
+
+def get_youtube_video_id(url, ignore_playlist=True):
+    """Extract YouTube video ID from URL"""
+    query = urlparse(url)
+    if query.hostname == 'youtu.be':
+        if query.path[1:] == 'watch':
+            return query.query[2:]
+        return query.path[1:]
+
+    if query.hostname in {'www.youtube.com', 'youtube.com', 'music.youtube.com'}:
+        if not ignore_playlist:
+            with suppress(KeyError):
+                return parse_qs(query.query)['list'][0]
+        if query.path == '/watch':
+            return parse_qs(query.query)['v'][0]
+        if query.path[:7] == '/watch/':
+            return query.path.split('/')[1]
+        if query.path[:7] == '/embed/':
+            return query.path.split('/')[2]
+        if query.path[:3] == '/v/':
+            return query.path.split('/')[2]
+    return None
